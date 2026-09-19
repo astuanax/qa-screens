@@ -233,6 +233,10 @@ and fake GitHub and Figma APIs. Assertions are about what those services actuall
 
 Releases are published to PyPI by GitHub Actions when a `v*` tag is pushed (trusted publishing).
 
+## Links
+
+- [sus.bot](https://sus.bot)
+
 ## License
 
 MIT
