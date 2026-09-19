@@ -22,7 +22,8 @@ def sync_figma(file_key: str, output_dir: Path, frame: str | None = None, token:
     if not token:
         raise QAUserError("FIGMA_TOKEN is not set")
     headers = {"X-Figma-Token": token}
-    with httpx.Client(base_url=API, headers=headers, timeout=60) as client:
+    api = os.environ.get("QA_SCREENS_FIGMA_API", API)
+    with httpx.Client(base_url=api, headers=headers, timeout=60) as client:
         resp = client.get(f"files/{file_key}")
         if resp.status_code in (403, 404):
             raise QAUserError(f"Figma file {file_key} not accessible (HTTP {resp.status_code})")
@@ -50,10 +51,10 @@ def sync_figma(file_key: str, output_dir: Path, frame: str | None = None, token:
         output_dir.mkdir(parents=True, exist_ok=True)
         written = []
         for node_id, url in images.json().get("images", {}).items():
-            if not url:
+            if not url or node_id not in id_to_name:  # only frames we asked for
                 continue
-            path = output_dir / f"{_safe(id_to_name.get(node_id, node_id))}.png"
-            img = httpx.get(url, timeout=120)
+            path = output_dir / f"{_safe(id_to_name[node_id])}.png"
+            img = httpx.get(url, timeout=120)  # signed CDN URL: must not carry the Figma token
             img.raise_for_status()
             path.write_bytes(img.content)
             written.append(path.stem)

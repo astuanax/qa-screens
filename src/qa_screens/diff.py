@@ -14,15 +14,29 @@ from .errors import QAUserError
 logger = logging.getLogger("qa_screens.diff")
 
 # Full-page captures can be hundreds of megapixels; beyond this we decode at
-# reduced resolution (1/2, 1/4, 1/8) so SSIM never OOMs the process.
-MAX_PIXELS = 40_000_000
+# reduced resolution (1/2, 1/4, 1/8) so SSIM never OOMs the process. Colour SSIM
+# keeps several float64 maps per channel: 12MP peaks well under 1GB.
+MAX_PIXELS = 12_000_000
+# A pixel "changed" when any channel differs by more than this (0-255); well above
+# antialiasing/font-hinting noise between two renders of the same page.
+COLOUR_TOLERANCE = 40
+
+
+def verdict(diff: dict, threshold: float, max_changed_ratio: float) -> bool:
+    """True if the comparison passes: similar overall AND no large area changed."""
+    return diff["score"] >= threshold and diff["changed_ratio"] <= max_changed_ratio
 _REDUCED = {1: cv2.IMREAD_COLOR, 2: cv2.IMREAD_REDUCED_COLOR_2, 4: cv2.IMREAD_REDUCED_COLOR_4, 8: cv2.IMREAD_REDUCED_COLOR_8}
 
 
 def image_size(path: str) -> tuple[int, int]:
     Image.MAX_IMAGE_PIXELS = None  # size read only; no decompression
-    with Image.open(path) as im:
-        return im.size
+    try:
+        with Image.open(path) as im:
+            return im.size
+    except FileNotFoundError:
+        raise QAUserError(f"Image not found: {path}") from None
+    except (OSError, SyntaxError) as e:  # UnidentifiedImageError is an OSError
+        raise QAUserError(f"Not a readable image: {path} ({e})") from None
 
 
 def _load(path: str, factor: int) -> np.ndarray:
@@ -58,13 +72,22 @@ def compute_diff(ref_path: str, live_path: str, diff_path: str | None = None, ma
     factor = next((f for f in (1, 2, 4, 8) if biggest / (f * f) <= MAX_PIXELS), 8)
 
     ref, live = _align(_load(ref_path, factor), _load(live_path, factor), align)
-    ref_gray, live_gray = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY), cv2.cvtColor(live, cv2.COLOR_BGR2GRAY)
-    if min(ref_gray.shape) < 7:
+    if min(ref.shape[:2]) < 7:
         raise QAUserError("Images are too small to compare (min 7x7 px)")
-    score, diff_map = ssim(ref_gray, live_gray, full=True, data_range=255)
+    # Per-channel (colour) SSIM: grayscale SSIM scores a green->red header recolour at
+    # ~0.985 and an equal-brightness hue swap at ~0.9996, i.e. colour regressions pass.
+    score, diff_map = ssim(ref, live, full=True, data_range=255, channel_axis=2)
+    diff_map = diff_map.min(axis=2)  # a pixel changed if any channel changed
 
     diff_inv = 255 - np.clip(diff_map * 255, 0, 255).astype("uint8")
     _, mask = cv2.threshold(diff_inv, 30, 255, cv2.THRESH_BINARY)
+    # SSIM is a page-wide average and barely notices a flat area changing colour
+    # (a recoloured header costs ~1%). Measure clearly changed colour separately, on
+    # slightly blurred images so JPEG ringing and 1px antialiasing don't count.
+    blur_a, blur_b = cv2.GaussianBlur(ref, (5, 5), 0), cv2.GaussianBlur(live, (5, 5), 0)
+    colour_changed = (cv2.absdiff(blur_a, blur_b).max(axis=2) > COLOUR_TOLERANCE).astype(np.uint8)
+    colour_changed = cv2.morphologyEx(colour_changed, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    mask[colour_changed == 1] = 255
 
     # Group changed pixels into boxes (in original-resolution coordinates).
     blobs = cv2.dilate(mask, np.ones((15, 15), np.uint8), iterations=2)
@@ -90,7 +113,8 @@ def compute_diff(ref_path: str, live_path: str, diff_path: str | None = None, ma
         "reference_size": list(ref_size),
         "live_size": list(live_size),
         "size_mismatch": ref_size != live_size,
-        "changed_ratio": round(float(np.count_nonzero(mask)) / mask.size, 5),
+        # Share of the page whose colour clearly changed (drives the max_changed_ratio check).
+        "changed_ratio": round(float(np.count_nonzero(colour_changed)) / colour_changed.size, 5),
         "regions": regions,
         "align": align,
     }

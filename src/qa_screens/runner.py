@@ -11,7 +11,7 @@ from . import reporting
 from .analyzer import generate_critique
 from .browser import BrowserManager, capture_page
 from .config import Config
-from .diff import compute_diff, make_preview
+from .diff import compute_diff, make_preview, verdict
 from .errors import QAUserError
 
 logger = logging.getLogger("qa_screens.runner")
@@ -43,8 +43,10 @@ async def capture_named(bm: BrowserManager, cfg: Config, name: str, out_path: Pa
 
 
 async def qa_page(bm: BrowserManager, cfg: Config, name: str, *, base_url: str | None = None, profile: str | None = None,
-                  url: str | None = None, threshold: float | None = None, align: str = "resize", preview: bool = True) -> dict:
+                  url: str | None = None, threshold: float | None = None, align: str = "resize", preview: bool = True,
+                  max_changed_ratio: float | None = None) -> dict:
     threshold = cfg.threshold if threshold is None else threshold
+    max_changed_ratio = cfg.max_changed_ratio if max_changed_ratio is None else max_changed_ratio
     ref = cfg.reference_file(name)
     rt = cfg.runtime_path
     live = rt / "live" / f"{name}.png"
@@ -52,13 +54,14 @@ async def qa_page(bm: BrowserManager, cfg: Config, name: str, *, base_url: str |
     diff = await asyncio.to_thread(
         compute_diff, str(ref), str(live), str(rt / "diff" / f"{name}_diff.png"), str(rt / "diff" / f"{name}_mask.png"), align
     )
-    passed = diff["score"] >= threshold
+    passed = verdict(diff, threshold, max_changed_ratio)
     # An error page makes the score meaningless: don't let the AI "fix" CSS against a 404.
     http_error = bool(meta["status"] and meta["status"] >= 400)
     result = {
         "page": name,
         "status": "ERROR" if http_error else ("PASS" if passed else "FAIL"),
         "threshold": threshold,
+        "max_changed_ratio": max_changed_ratio,
         **diff,
         "reference_path": str(ref),
         "live_path": str(live),
@@ -97,16 +100,23 @@ def select_pages(cfg: Config, pages: list[str] | None, viewport: str) -> list[st
 
 async def qa_batch(bm: BrowserManager, cfg: Config, *, pages: list[str] | None = None, viewport: str = "all",
                    base_url: str | None = None, profile: str | None = None, threshold: float | None = None,
-                   align: str = "resize", preview: bool = True) -> dict:
+                   align: str = "resize", preview: bool = True, max_changed_ratio: float | None = None) -> dict:
     names = select_pages(cfg, pages, viewport)
     if not names:
-        raise QAUserError(f"No reference screenshots matched in {cfg.references_path}")
+        where = cfg.references_path
+        found = "no" if not cfg.list_references() else f"no {viewport}"
+        raise QAUserError(
+            f"There are {found} reference screenshots in {where}. To get some: (1) add PNG/JPG files named "
+            "after pages (home.png, home-mobile.png), (2) sync_figma, or (3) update_reference(page=..., "
+            "confirm=true) to use the current site as the baseline. For refactors you can skip references: "
+            "capture_set before/after + compare_sets. If they live elsewhere, set references_dir in .qa-screens.json.")
     sem = asyncio.Semaphore(cfg.concurrency)
 
     async def one(n):
         async with sem:
             return await _guard(
-                qa_page(bm, cfg, n, base_url=base_url, profile=profile, threshold=threshold, align=align, preview=preview),
+                qa_page(bm, cfg, n, base_url=base_url, profile=profile, threshold=threshold, align=align, preview=preview,
+                        max_changed_ratio=max_changed_ratio),
                 n, {"tool": "run_qa"},
             )
 
@@ -150,7 +160,8 @@ async def capture_set(bm: BrowserManager, cfg: Config, label: str, *, pages: lis
             "failed": [r for r in rows if r["status"] != "OK"], "warnings": [r for r in rows if r.get("warning")]}
 
 
-def compare_sets(cfg: Config, before: str, after: str, threshold: float = 0.99, align: str = "crop") -> dict:
+def compare_sets(cfg: Config, before: str, after: str, threshold: float = 0.99, align: str = "crop",
+                 max_changed_ratio: float = 0.001) -> dict:
     """SSIM-diff two capture sets page by page. A label or a directory path is accepted for each side."""
     def resolve(x: str) -> Path:
         p = Path(x)
@@ -166,7 +177,8 @@ def compare_sets(cfg: Config, before: str, after: str, threshold: float = 0.99, 
     rows = []
     for n in sorted(b_names & a_names):
         d = compute_diff(str(b_dir / f"{n}.png"), str(a_dir / f"{n}.png"), str(diff_dir / f"{n}_diff.png"), None, align)
-        row = {"page": n, "score": d["score"], "changed": d["score"] < threshold, "size_mismatch": d["size_mismatch"]}
+        row = {"page": n, "score": d["score"], "changed_ratio": d["changed_ratio"],
+               "changed": not verdict(d, threshold, max_changed_ratio), "size_mismatch": d["size_mismatch"]}
         if row["changed"]:
             row["diff_path"] = d["diff_path"]
             row["regions"] = d["regions"][:5]
@@ -176,6 +188,7 @@ def compare_sets(cfg: Config, before: str, after: str, threshold: float = 0.99, 
     rows.sort(key=lambda r: r["score"])
     return {
         "threshold": threshold,
+        "max_changed_ratio": max_changed_ratio,
         "compared": len(rows),
         "identical": not any(r["changed"] for r in rows) and bool(rows),
         "changed": [r for r in rows if r["changed"]],

@@ -11,6 +11,7 @@ Configuration (environment):
   QA_SCREENS_ISSUE_REPO       owner/repo to post to (default: astuanax/qa-screens)
   QA_SCREENS_GITHUB_TOKEN     token with issues:write; falls back to GITHUB_TOKEN,
                               then `gh auth token`. No token -> stays pending.
+  QA_SCREENS_GITHUB_API       API base URL (default https://api.github.com; set for GitHub Enterprise)
 
 Reports are scrubbed: bearer tokens, JWTs, cookies, passwords, secrets in
 key=value pairs and URL query strings / credentials are redacted before posting.
@@ -94,12 +95,12 @@ def is_significant(exc: BaseException) -> bool:
 
 
 def fingerprint(exc_type: str, tb_text: str) -> str:
-    """Stable across runs: exception type + our own frames (file:function), no line numbers/values."""
+    """Stable across runs: exception type + our own frames (file:function), no line numbers/values.
+    Each frame counts once, so recursion depth doesn't split one bug into many issues."""
     frames = re.findall(r'File "([^"]+)", line \d+, in (\S+)', tb_text)
-    ours = [f"{Path(f).name}:{fn}" for f, fn in frames if "qa_screens" in f] or [
-        f"{Path(f).name}:{fn}" for f, fn in frames[-3:]
-    ]
-    return hashlib.sha1(f"{exc_type}|{'>'.join(ours)}".encode()).hexdigest()[:12]
+    names = [f"{Path(f).name}:{fn}" for f, fn in frames]
+    ours = [n for (f, _), n in zip(frames, names) if "qa_screens" in f] or names[-3:]
+    return hashlib.sha1(f"{exc_type}|{'>'.join(dict.fromkeys(ours))}".encode()).hexdigest()[:12]
 
 
 def _environment() -> dict:
@@ -139,9 +140,13 @@ def write_pending(report: dict) -> Path:
 
 def record_exception(exc: BaseException, kind: str = "error", context: dict | None = None, post: bool = True) -> Path | None:
     """Persist a significant exception and (optionally) post it in the background."""
-    if mode() == "off" or not is_significant(exc):
+    if mode() == "off" or not is_significant(exc) or getattr(exc, "_qa_screens_reported", False):
         return None
     try:
+        try:
+            exc._qa_screens_reported = True  # a re-raise reaching the crash hook isn't a second report
+        except Exception:
+            pass
         tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         path = write_pending(build_report(kind, type(exc).__name__, str(exc), tb_text, context))
         if post:
@@ -239,7 +244,8 @@ def flush_pending() -> list[str]:
         ledger = _load_ledger()
         urls: list[str] = []
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-        with httpx.Client(base_url=GITHUB_API, headers=headers, timeout=20, transport=_transport) as client:
+        api = os.environ.get("QA_SCREENS_GITHUB_API", GITHUB_API)
+        with httpx.Client(base_url=api, headers=headers, timeout=20, transport=_transport) as client:
             for f in files:
                 try:
                     r = json.loads(f.read_text(encoding="utf-8"))
@@ -277,6 +283,18 @@ _fault_file = None
 
 
 def _pid_alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        # os.kill(pid, 0) would send CTRL_C_EVENT on Windows; ask the kernel instead.
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel32.CloseHandle(handle)
+        return code.value == 259  # STILL_ACTIVE
     try:
         os.kill(pid, 0)
         return True

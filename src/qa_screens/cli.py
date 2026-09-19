@@ -20,15 +20,18 @@ def _run(args) -> int:
     setup_logging()
     reporting.install_crash_handlers()
     reporting.startup_scan(background=False)
-    cfg = load_config(args.root)
-    if args.concurrency:
-        cfg.concurrency = args.concurrency
 
     async def go():
+        cfg = load_config(args.root)
+        for w in cfg.warnings:
+            print(f"warning: {w}", file=sys.stderr)
+        if args.concurrency:
+            cfg.concurrency = args.concurrency
         bm = BrowserManager()
         try:
             return await qa_batch(bm, cfg, pages=args.pages or None, viewport=args.viewport, base_url=args.base_url,
-                                  profile=args.profile, threshold=args.threshold, align=args.align, preview=True)
+                                  profile=args.profile, threshold=args.threshold, align=args.align, preview=True,
+                                  max_changed_ratio=args.max_changed_ratio)
         finally:
             await bm.stop()
 
@@ -80,6 +83,7 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("--base-url")
     r.add_argument("--profile", help="auth profile")
     r.add_argument("--threshold", type=float)
+    r.add_argument("--max-changed-ratio", type=float, help="fail if more than this fraction of pixels changed (default 0.02)")
     r.add_argument("--viewport", choices=["all", "desktop", "mobile"], default="all")
     r.add_argument("--align", choices=["resize", "crop", "pad"], default="resize")
     r.add_argument("--concurrency", type=int)

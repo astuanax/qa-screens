@@ -5,12 +5,12 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 
 from playwright.async_api import Browser, BrowserContext, Error as PlaywrightError, async_playwright
 
 from .auth import ProfileStore, apply_to_context, context_kwargs, prepare_profile
-from .auth.oauth import token_expired
 from .config import Config
 from .errors import QAUserError
 
@@ -22,10 +22,45 @@ MOBILE_UA = (
 )
 
 
+_install_lock = threading.Lock()
+
+
 def install_chromium() -> None:
-    """Install Playwright's Chromium. Output goes to stderr: stdout is the MCP channel."""
-    logger.info("Installing Playwright Chromium (first run)...")
-    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, stdout=sys.stderr, stderr=sys.stderr)
+    """Install Playwright's Chromium if missing (idempotent, fast when present).
+
+    Never prints to stdout: that is the MCP channel."""
+    with _install_lock:
+        logger.info("Checking/installing Playwright Chromium...")
+        try:
+            r = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
+                               capture_output=True, text=True, timeout=900)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise QAUserError(f"Could not run the Chromium installer ({e}). Install it yourself with: "
+                              f"{sys.executable} -m playwright install chromium") from None
+        if r.returncode != 0:
+            tail = " ".join((r.stderr or r.stdout).strip().splitlines()[-3:])[:400]
+            raise QAUserError("Could not download Chromium for screenshots (network, proxy or disk problem?): "
+                              f"{tail}. Retry, or install it yourself with: {sys.executable} -m playwright install chromium")
+        logger.info("Chromium is ready")
+
+
+def start_background_install() -> None:
+    """Fetch Chromium at server start, so the first tool call doesn't wait for a ~150MB download."""
+    def run():
+        try:
+            install_chromium()
+        except QAUserError as e:
+            logger.warning("%s", e)  # the first capture retries and shows this message
+
+    threading.Thread(target=run, name="qa-screens-chromium-install", daemon=True).start()
+
+
+def _launch_error(e: Exception) -> QAUserError | None:
+    msg = str(e)
+    if "missing dependencies" in msg or "error while loading shared libraries" in msg:
+        return QAUserError("Chromium is installed but can't start: this machine is missing system libraries. "
+                           f"Install them once with: sudo {sys.executable} -m playwright install-deps chromium")
+    return None
 
 
 def has_display() -> bool:
@@ -49,9 +84,12 @@ class BrowserManager:
             return await self._pw.chromium.launch(headless=headless)
         except PlaywrightError as e:
             if "Executable doesn't exist" not in str(e):
-                raise
-            await asyncio.to_thread(install_chromium)
+                raise _launch_error(e) or e
+        await asyncio.to_thread(install_chromium)  # waits for a background install in progress
+        try:
             return await self._pw.chromium.launch(headless=headless)
+        except PlaywrightError as e:
+            raise _launch_error(e) or e
 
     async def browser(self) -> Browser:
         async with self._lock:
@@ -90,7 +128,7 @@ class BrowserManager:
             prof = await prepare_profile(self.profiles, profile)
             kw.update(context_kwargs(self.profiles, prof))
             tok = prof.get("token") or {}
-            expires_at = tok.get("expires_at") if not token_expired(tok) else None
+            expires_at = tok.get("expires_at")
         ctx = await browser.new_context(**kw)
         if prof:
             await apply_to_context(ctx, prof, base_url or cfg.base_url)
@@ -146,11 +184,28 @@ async def capture_page(
         cdp = await context.new_cdp_session(page)
         await cdp.send("Network.setCacheDisabled", {"cacheDisabled": True})
         await page.emulate_media(media="screen")
+        notes = []
+        nav_responses = []  # kept even when goto() times out before returning its response
+        page.on("response", lambda r: nav_responses.append(r)
+                if r.request.is_navigation_request() and r.frame == page.main_frame else None)
         try:
             resp = await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
         except PlaywrightError as e:
+            resp = None
             msg = str(e).splitlines()[0]
-            raise QAUserError(f"Could not load {url}: {msg}") from e
+            if "ERR_CONNECTION_REFUSED" in msg:
+                raise QAUserError(f"Nothing is running at {url}. Start the site/dev server, or set base_url in "
+                                  ".qa-screens.json (or pass base_url) to where it runs.") from None
+            if "ERR_NAME_NOT_RESOLVED" in msg:
+                raise QAUserError(f"Host not found for {url}: check base_url / the URL.") from None
+            if "Timeout" in msg and wait_until == "networkidle" and page.url not in ("about:blank", ""):
+                # Apps that poll or keep websockets open never go idle: capture once loaded.
+                notes.append("the network never went idle (polling/websockets?); captured after 'load'. "
+                             'Set "wait_until": "load" in .qa-screens.json to skip the wait.')
+                await page.wait_for_load_state("load", timeout=timeout_ms)
+            else:
+                raise QAUserError(f"Could not load {url}: {msg}") from None
+        resp = resp or (nav_responses[-1] if nav_responses else None)
         status = resp.status if resp else None
         if wait_for_selector:
             try:
@@ -170,7 +225,9 @@ async def capture_page(
         else:
             await page.screenshot(path=output_path, full_page=full_page)
         meta = {"url": url, "final_url": page.url, "status": status, "path": output_path}
-        if status and status >= 400:
+        if notes:
+            meta["warning"] = "; ".join(notes)
+        elif status and status >= 400:
             meta["warning"] = f"HTTP {status} — the capture shows an error page"
         elif page.url.split("#")[0].rstrip("/") != url.split("#")[0].rstrip("/"):
             meta["warning"] = f"Redirected to {page.url} (login wall or expired session?)"

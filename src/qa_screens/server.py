@@ -20,9 +20,9 @@ from . import __version__, reporting, runner
 from .auth import ProfileStore, profile_origins
 from .auth.oauth import authorization_code_flow, fetch_token
 from .auth.profiles import origin_of, resolve
-from .browser import BrowserManager, capture_page
+from .browser import BrowserManager, capture_page, start_background_install
 from .config import load_config, state_dir
-from .diff import compute_diff, make_preview
+from .diff import compute_diff, make_preview, verdict
 from .errors import AuthError, QAUserError
 from .figma import sync_figma as _sync_figma
 
@@ -72,11 +72,13 @@ def tool(fn):
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
         try:
-            return await fn(*args, **kwargs)
+            return _with_config_warnings(await fn(*args, **kwargs))
         except ToolError:
             raise
         except QAUserError as e:
-            raise ToolError(str(e)) from None
+            warnings = load_config().warnings
+            extra = ("\n\nConfig warnings (fix .qa-screens.json):\n- " + "\n- ".join(warnings)) if warnings else ""
+            raise ToolError(f"{e}{extra}") from None
         except Exception as e:
             path = reporting.record_exception(e, context={"tool": fn.__name__, "args": reporting.scrub_args(kwargs)})
             note = " An error report was filed for the qa-screens maintainers." if path else ""
@@ -85,8 +87,42 @@ def tool(fn):
     return mcp.tool(structured_output=False)(wrapper)
 
 
+def _with_config_warnings(result):
+    """Attach config warnings to a tool result so the agent sees (and can fix) them."""
+    warnings = load_config().warnings
+    if not warnings:
+        return result
+    items = result if isinstance(result, list) else [result]
+    first = items[0] if items else None
+    if isinstance(first, str):
+        try:
+            data = json.loads(first)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            data["config_warnings"] = warnings
+            items = [_json(data), *items[1:]]
+            return items if isinstance(result, list) else items[0]
+    note = _json({"config_warnings": warnings})
+    return [*items, note] if isinstance(result, list) else [result, note]
+
+
 def _json(data: Any) -> str:
     return json.dumps(data, indent=2, default=str)
+
+
+def _thumbnail(path: Path, out_dir: Path) -> Image:
+    """A downscaled copy of a (possibly very tall) screenshot, sized for a vision model."""
+    from PIL import Image as PILImage
+
+    PILImage.MAX_IMAGE_PIXELS = None
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{path.stem}_thumb.png"
+    with PILImage.open(path) as im:
+        im = im.convert("RGB")
+        im.thumbnail((1200, 3000))
+        im.save(out)
+    return Image(path=str(out))
 
 
 def _images(paths: list[str | None], limit: int) -> list[Image]:
@@ -125,6 +161,7 @@ async def run_qa(
     threshold: float | None = None,
     align: str = "resize",
     max_images: int = 3,
+    max_changed_ratio: float | None = None,
 ) -> list:
     """Capture pages from the running site and SSIM-compare them with the reference screenshots.
 
@@ -133,12 +170,14 @@ async def run_qa(
     profile: auth profile for pages behind a login.
     align: how to handle different image sizes — resize (default, legacy), crop, or pad
       (pad makes page-height changes count as differences).
+    A page FAILs when SSIM < threshold OR more than max_changed_ratio of its pixels clearly
+    changed colour (catches local changes such as a recoloured header that SSIM averages away).
     Returns a JSON summary (failures first, with changed regions in px) plus side-by-side
     reference|live preview images of up to `max_images` failing pages.
     """
     cfg = load_config()
     summary = await runner.qa_batch(browsers(), cfg, pages=pages, viewport=viewport, base_url=base_url,
-                                    profile=profile, threshold=threshold, align=align)
+                                    profile=profile, threshold=threshold, align=align, max_changed_ratio=max_changed_ratio)
     previews = [r.get("preview_path") for r in summary["pages"] if r["status"] == "FAIL"]
     return [_json(summary), *_images(previews, max_images)]
 
@@ -151,13 +190,14 @@ async def qa_page(
     profile: str | None = None,
     threshold: float | None = None,
     align: str = "resize",
+    max_changed_ratio: float | None = None,
 ) -> list:
     """QA a single page against its reference (fast iteration while fixing).
     `url` overrides the route mapping for this call. Returns the result and, on failure, a
     reference|live side-by-side preview cropped around the changed regions."""
     cfg = load_config()
     r = await runner.qa_page(browsers(), cfg, page, base_url=base_url, profile=profile, url=url,
-                             threshold=threshold, align=align)
+                             threshold=threshold, align=align, max_changed_ratio=max_changed_ratio)
     return [_json(r), *_images([r.get("preview_path")], 1)]
 
 
@@ -179,26 +219,20 @@ async def capture(
         raise QAUserError("viewport must be desktop or mobile")
     name = re.sub(r"[^A-Za-z0-9_-]+", "_", name or url.split("://", 1)[-1]).strip("_")[:80] or "capture"
     out = cfg.runtime_path / "captures" / f"{name}.png"
-    ctx = await browsers().context(cfg, viewport == "mobile", profile or cfg.default_profile, url)
+    # Credentials stay scoped to the app (profile origins / base_url), never to the captured URL.
+    ctx = await browsers().context(cfg, viewport == "mobile", profile or cfg.default_profile)
     meta = await capture_page(ctx, url, str(out), full_page=full_page, wait_until=cfg.wait_until,
                               timeout_ms=cfg.navigation_timeout_ms, wait_for_selector=wait_for_selector,
                               mask_selectors=cfg.mask_selectors, clip_selector=clip_selector)
     result: list = [_json(meta)]
     if return_image:
-        from PIL import Image as PILImage
-
-        preview = cfg.runtime_path / "captures" / f"{name}_preview.png"
-        PILImage.MAX_IMAGE_PIXELS = None
-        with PILImage.open(out) as im:  # downscaled copy sized for the model
-            im = im.convert("RGB")
-            im.thumbnail((1200, 3000))
-            im.save(preview)
-        result.append(Image(path=str(preview)))
+        result.append(_thumbnail(out, out.parent))
     return result
 
 
 @tool
-async def compare_images(image_a: str, image_b: str, threshold: float = 0.95, align: str = "pad") -> list:
+async def compare_images(image_a: str, image_b: str, threshold: float = 0.95, align: str = "pad",
+                         max_changed_ratio: float = 0.02) -> list:
     """SSIM-compare two image files (e.g. a Figma export vs a capture). Paths may be relative
     to the project root. Returns score, changed regions, a heatmap path and an a|b preview."""
     cfg = load_config()
@@ -208,7 +242,7 @@ async def compare_images(image_a: str, image_b: str, threshold: float = 0.95, al
             raise QAUserError(f"Image not found: {p}")
     tag = f"{Path(a).stem}__vs__{Path(b).stem}"
     d = await asyncio.to_thread(compute_diff, a, b, str(cfg.runtime_path / "diff" / f"{tag}_diff.png"), None, align)
-    d["status"] = "PASS" if d["score"] >= threshold else "FAIL"
+    d["status"] = "PASS" if verdict(d, threshold, max_changed_ratio) else "FAIL"
     preview = await asyncio.to_thread(make_preview, a, b, d["regions"], str(cfg.runtime_path / "diff" / f"{tag}_preview.png"))
     return [_json(d), Image(path=preview)]
 
@@ -233,10 +267,10 @@ async def capture_set(
 
 @tool
 async def compare_sets(before: str = "before", after: str = "after", threshold: float = 0.99,
-                       align: str = "crop", max_images: int = 3) -> list:
+                       align: str = "crop", max_images: int = 3, max_changed_ratio: float = 0.001) -> list:
     """Diff two capture sets (labels from capture_set, or directories). `identical: true`
     means every page scored >= threshold. Returns previews of the most-changed pages."""
-    r = await asyncio.to_thread(runner.compare_sets, load_config(), before, after, threshold, align)
+    r = await asyncio.to_thread(runner.compare_sets, load_config(), before, after, threshold, align, max_changed_ratio)
     return [_json(r), *_images([c.get("preview_path") for c in r["changed"]], max_images)]
 
 
@@ -250,28 +284,41 @@ async def ab_compare(
     profile_b: str | None = None,
     threshold: float = 0.999,
     max_images: int = 3,
+    max_changed_ratio: float = 0.001,
 ) -> list:
     """Compare two running servers (e.g. main branch on :8080 vs a worktree on :8091) page by page."""
     cfg, bm = load_config(), browsers()
     a = await runner.capture_set(bm, cfg, "ab_a", pages=pages, viewport=viewport, base_url=base_url_a, profile=profile_a)
     b = await runner.capture_set(bm, cfg, "ab_b", pages=pages, viewport=viewport, base_url=base_url_b, profile=profile_b)
-    r = await asyncio.to_thread(runner.compare_sets, cfg, "ab_a", "ab_b", threshold, "crop")
+    r = await asyncio.to_thread(runner.compare_sets, cfg, "ab_a", "ab_b", threshold, "crop", max_changed_ratio)
     r["capture_failures"] = {"a": a["failed"], "b": b["failed"]}
     return [_json(r), *_images([c.get("preview_path") for c in r["changed"]], max_images)]
 
 
 @tool
-async def update_reference(page: str, confirm: bool = False, source: str | None = None) -> str:
-    """Replace a reference screenshot with the latest live capture (or `source` image).
-    Only do this when the USER has confirmed the new look is intentional; set confirm=true."""
+async def update_reference(page: str, confirm: bool = False, source: str | None = None,
+                           profile: str | None = None) -> list:
+    """Make the current look of a page its reference screenshot: from `source` (an image),
+    else the latest qa_page capture, else a fresh capture right now (so this also creates a
+    first baseline for a page that has no reference yet). The old reference is backed up.
+    Only do this when the USER has confirmed the look is intended; set confirm=true."""
     if not confirm:
-        raise QAUserError("Refusing: pass confirm=true only after the user confirmed the new design is intended")
+        raise QAUserError("Refusing: pass confirm=true only after the user confirmed this look is intended")
+    if not re.fullmatch(r"[A-Za-z0-9_. -]{1,120}", page) or ".." in page:
+        raise QAUserError("page must be a plain name such as 'home' or 'home-mobile'")
     cfg = load_config()
-    src = Path(source) if source else cfg.runtime_path / "live" / f"{page}.png"
-    if not src.is_absolute():
-        src = cfg.root / src
-    if not src.exists():
-        raise QAUserError(f"No capture at {src}; run qa_page first")
+    if source:
+        src = Path(source) if Path(source).is_absolute() else cfg.root / source
+        if not src.exists():
+            raise QAUserError(f"Image not found: {src}")
+    else:
+        src = cfg.runtime_path / "live" / f"{page}.png"
+        if not src.exists():
+            meta = await runner.capture_named(browsers(), cfg, page, src, profile=profile)
+            if meta["status"] and meta["status"] >= 400:
+                src.unlink(missing_ok=True)
+                raise QAUserError(f"{meta['url']} returned HTTP {meta['status']}; not saving an error page as the "
+                                  "reference. Check the route mapping (qa_config) or that the page exists.")
     dest = cfg.references_path / f"{page}.png"
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
@@ -279,7 +326,7 @@ async def update_reference(page: str, confirm: bool = False, source: str | None 
         backup.parent.mkdir(parents=True, exist_ok=True)
         backup.write_bytes(dest.read_bytes())
     dest.write_bytes(src.read_bytes())
-    return _json({"updated": str(dest), "from": str(src)})
+    return [_json({"updated": str(dest), "from": str(src)}), _thumbnail(dest, cfg.runtime_path / "thumbs")]
 
 
 @tool
@@ -502,7 +549,7 @@ async def auth_check(name: str, url: str | None = None) -> list:
     prof = store.get(name)
     target = url or (profile_origins(prof, cfg.base_url) or [cfg.base_url])[0]
     out = cfg.runtime_path / "captures" / f"auth_check_{name}.png"
-    ctx = await browsers().context(cfg, False, name, target)
+    ctx = await browsers().context(cfg, False, name)
     meta = await capture_page(ctx, target, str(out), full_page=False, wait_until="load", timeout_ms=cfg.navigation_timeout_ms)
     meta["authenticated_guess"] = not meta.get("warning")
     meta["profile"] = store.summary(name)
@@ -559,5 +606,6 @@ def serve() -> None:
     setup_logging()
     reporting.install_crash_handlers()
     reporting.startup_scan(background=True)
+    start_background_install()
     logger.info("qa-screens %s starting (stdio)", __version__)
     mcp.run("stdio")

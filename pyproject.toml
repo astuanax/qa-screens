@@ -41,3 +41,5 @@ packages = ["src/qa_screens"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+addopts = "-m 'not first_run'"
+markers = ["first_run: starts from a machine without Chromium (downloads it); run with -m first_run"]

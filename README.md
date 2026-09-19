@@ -13,6 +13,24 @@ so the agent can see what broke and fix it.
 - **Self-reporting**: significant errors and crashes are filed as GitHub issues automatically,
   with secrets scrubbed. See [Error reporting](#error-reporting).
 
+## Quick start
+
+No configuration is needed for a first run:
+
+```bash
+claude mcp add qa-screens -- uvx qa-screens
+```
+
+Then ask the agent: *"Use qa-screens to make the current homepage the reference, then check it."*
+
+1. The first call downloads Chromium (it starts in the background as soon as the server starts).
+2. `update_reference(page="home", confirm=true)` screenshots `http://localhost:8080/home/`
+   and saves it as `screenshots/home.png`. Append `-mobile` to the name for the mobile version.
+3. `run_qa` compares the live site with the references from then on.
+
+If your site runs somewhere else, the error message says so. Set `base_url` in
+`.qa-screens.json` (see [Configure](#configure)) or pass `base_url` to the tool.
+
 ## Install
 
 ```bash
@@ -50,7 +68,10 @@ and it runs in the project directory, or wherever `QA_SCREENS_ROOT` points.
 
 ## Configure
 
-Put a `.qa-screens.json` in the project root. Every key is optional:
+Put a `.qa-screens.json` in the project root. Every key is optional. A mistake in this
+file never stops the tools: bad JSON, unknown keys (with a "did you mean" hint) and invalid
+values fall back to the defaults, and every tool result lists them under `config_warnings`
+(the CLI prints them as `warning:` lines).
 
 ```json
 {
@@ -72,6 +93,7 @@ Put a `.qa-screens.json` in the project root. Every key is optional:
 | `route_template` | `/{name}/` | page name → path; `{name}` excludes the `-mobile` suffix |
 | `routes` | `{}` | per-page overrides (a path, or a full URL) |
 | `threshold` | `0.90` | minimum SSIM to pass |
+| `max_changed_ratio` | `0.02` | also fail when more than this share of pixels clearly changed colour (`1` disables) |
 | `mobile_suffix` | `-mobile` | names ending in it are captured in a 390px mobile context |
 | `desktop_viewport` / `mobile_viewport` | 1440×900 / 390×844 | |
 | `mobile_device_scale_factor` | `2` | set `1` if mobile references are 390px wide |
@@ -82,7 +104,8 @@ Put a `.qa-screens.json` in the project root. Every key is optional:
 | `ai_critique`, `gemini_model` | `false` | optional Gemini second opinion (`pip install qa-screens[ai]`, `GEMINI_API_KEY`) |
 
 The environment variables `QA_SCREENS_BASE_URL`, `QA_SCREENS_REFERENCES_DIR`,
-`QA_SCREENS_ROUTE_TEMPLATE`, `QA_SCREENS_THRESHOLD` and `QA_SCREENS_PROFILE` override the file.
+`QA_SCREENS_ROUTE_TEMPLATE`, `QA_SCREENS_THRESHOLD`, `QA_SCREENS_MAX_CHANGED_RATIO` and
+`QA_SCREENS_PROFILE` override the file. `QA_SCREENS_FIGMA_API` changes the Figma API URL.
 
 ## Tools
 
@@ -95,7 +118,7 @@ The environment variables `QA_SCREENS_BASE_URL`, `QA_SCREENS_REFERENCES_DIR`,
 | `compare_images` | SSIM two image files, for example a Figma export and a capture |
 | `capture_set` / `compare_sets` | before/after parity check for refactors |
 | `ab_compare` | compare two running servers page by page |
-| `update_reference` | promote a live capture to reference (needs `confirm=true`, keeps a backup) |
+| `update_reference` | make the page's current look its reference: first baseline or accepted redesign (needs `confirm=true`, keeps a backup, refuses error pages) |
 | `sync_figma` | download Figma frames as references (`FIGMA_TOKEN`) |
 | `auth_update_profile` | create or update an auth profile: token, OAuth, cookies, headers, storage |
 | `auth_browser_login` | log in with a real browser (form, SSO or MFA) and save the session |
@@ -105,7 +128,10 @@ The environment variables `QA_SCREENS_BASE_URL`, `QA_SCREENS_REFERENCES_DIR`,
 | `auth_profiles` / `auth_delete_profile` | list, inspect (never shows secrets) or delete profiles |
 | `error_reports` | error-reporting status; `flush=true` posts pending reports |
 
-Page results are `PASS`, `FAIL` or `ERROR`. `ERROR` means the comparison is meaningless:
+Page results are `PASS`, `FAIL` or `ERROR`. A page fails when its SSIM is below `threshold`
+**or** more than `max_changed_ratio` of it clearly changed colour. SSIM is a page-wide average,
+so a recoloured header scores about 0.99 and would pass on SSIM alone.
+`ERROR` means the comparison is meaningless:
 an HTTP 4xx/5xx, a navigation failure or a missing reference. The agent should fix
 the environment, not the CSS.
 
@@ -161,6 +187,7 @@ qa-screens reports its own bugs, so they reach the maintainers without a manual 
 | `QA_SCREENS_ERROR_REPORTING` | `on` | `on`, `local` (write files, never post) or `off` |
 | `QA_SCREENS_ISSUE_REPO` | `astuanax/qa-screens` | where issues go (point it at your fork) |
 | `QA_SCREENS_GITHUB_TOKEN` | falls back to `GITHUB_TOKEN`, then `gh auth token` | needs `issues:write` |
+| `QA_SCREENS_GITHUB_API` | `https://api.github.com` | API URL, for GitHub Enterprise |
 
 Without a token nothing is posted; reports wait in `pending/`. `qa-screens reports --flush`
 posts them by hand.
@@ -183,10 +210,13 @@ A report is written to `.qa-screens/runtime/reports/latest.json` on every run.
 2. The page is loaded with the HTTP cache disabled (so the CSS you just edited is what gets
    measured), with animations, transitions and scrollbars disabled, and after
    `document.fonts.ready`. It is captured full-page.
-3. SSIM is computed on grayscale images. Captures above 40MP are decoded at reduced
-   resolution, so long pages never run out of memory. Different sizes are handled by `align`:
-   `resize` (legacy default), `crop` or `pad` (height changes count as differences).
-4. Changed pixels are grouped into region boxes. A red heatmap and a cropped side-by-side
+3. SSIM is computed per colour channel. Grayscale SSIM, as the original tool used, scores a
+   pure hue change at 0.9996. Captures above 12MP are decoded at reduced resolution, so long
+   pages never run out of memory. Different sizes are handled by `align`: `resize` (legacy
+   default), `crop` or `pad` (height changes count as differences).
+4. Separately, pixels whose colour clearly changed are measured on lightly blurred images,
+   so JPEG artefacts and antialiasing don't count. Their share of the page is `changed_ratio`.
+5. Changed pixels are grouped into region boxes. A red heatmap and a cropped side-by-side
    preview are written, and the preview is returned to the agent as an image.
 
 ## Development
@@ -196,6 +226,10 @@ uv venv && uv pip install -e ".[dev]"
 python -m playwright install chromium
 pytest
 ```
+
+The tests exercise the server the way an agent does: through an in-process MCP client,
+against a fake web app (login form, session cookies, OAuth provider with PKCE, basic auth)
+and fake GitHub and Figma APIs. Assertions are about what those services actually received.
 
 Releases are published to PyPI by GitHub Actions when a `v*` tag is pushed (trusted publishing).
 

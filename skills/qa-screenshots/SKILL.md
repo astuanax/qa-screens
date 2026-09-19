@@ -28,7 +28,8 @@ the user to start the dev server (or fix `route_template`/`routes` in `.qa-scree
 ## 2. Diagnose each failure
 
 For each FAIL: look at the preview image, read `regions` (x/y/width/height in px,
-largest first) and `size_mismatch`/`warning`. Identify the cause (spacing, color,
+largest first) and `size_mismatch`/`warning`. A high `score` with a high `changed_ratio`
+means a local colour change (for example a recoloured button or header). Identify the cause (spacing, color,
 font, missing/extra element, layout shift) and trace it to the source file.
 `ERROR` is not a visual failure — it's a 4xx/5xx, a redirect to a login page, or
 a missing reference; fix the environment, not the CSS.
@@ -56,6 +57,6 @@ Prefer `env:VAR` for secrets so they never appear in the conversation.
 
 ## Don'ts
 
-- Don't update references or lower `threshold` to make a page pass.
+- Don't update references or loosen `threshold` / `max_changed_ratio` to make a page pass.
 - Don't skip the final full run.
 - Don't treat an `ERROR` row as a design regression.
