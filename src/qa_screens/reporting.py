@@ -329,7 +329,7 @@ def collect_crashes() -> int:
 def install_crash_handlers() -> None:
     """Log uncaught exceptions and hard crashes (segfaults, aborts) to crash files."""
     global _fault_file
-    if mode() == "off":
+    if mode() == "off" or _fault_file is not None:  # idempotent
         return
     _, _, crash = _dirs()
     fault_path = crash / f"faulthandler-{os.getpid()}.log"

@@ -234,21 +234,20 @@ def test_crash_while_offline_is_posted_on_next_start(project, github, isolated_s
         server.kill()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
 def test_hard_crash_is_logged_to_a_file_and_posted_on_next_start(project, github):
-    # The real server segfaults one second after starting (e.g. a native library bug).
-    segv = ("import faulthandler, threading\n"
-            "from qa_screens.cli import main\n"
-            "threading.Timer(1.0, faulthandler._sigsegv).start()\n"
-            "main(['serve'])\n")
-    p = subprocess.Popen([sys.executable, "-c", segv], cwd=project.root, env=_env(), stdin=subprocess.PIPE,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    assert p.wait(timeout=30) != 0
+    import signal
+
+    # The running server dies from a segfault (e.g. a bug in a native library).
+    server, first = _start_server_and_list_tools(project.root)
+    assert '"result"' in first
+    server.send_signal(signal.SIGSEGV)
+    assert server.wait(timeout=30) != 0
 
     server, _ = _start_server_and_list_tools(project.root)
     try:
         issue = wait_for(lambda: github.issues and github.issues[0], what="segfault issue")
-        assert "Fatal Python error" in issue["title"] or "Segmentation fault" in issue["body"]
-        assert "crash" in issue["body"]
+        assert "Segmentation fault" in issue["body"] and "crash" in issue["body"]
     finally:
         server.kill()
 

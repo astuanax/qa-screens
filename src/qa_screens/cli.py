@@ -93,6 +93,11 @@ def main(argv: list[str] | None = None) -> None:
     rep.add_argument("--flush", action="store_true", help="post pending reports to GitHub now")
 
     args = p.parse_args(argv)
+    if args.cmd in (None, "serve", "run"):
+        # Before the heavy imports (Playwright, OpenCV, MCP): a crash while loading them counts too.
+        from . import reporting
+
+        reporting.install_crash_handlers()
     if args.cmd in (None, "serve"):
         from .server import serve
 
